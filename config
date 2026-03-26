@@ -1,5 +1,7 @@
 auto-update-channel=tip
 
+theme = Chalk
+
 
 custom-shader = shaders/cursor_smear.glsl
 
