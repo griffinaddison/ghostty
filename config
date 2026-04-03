@@ -3,7 +3,9 @@ auto-update-channel=tip
 theme = Chalk
 
 
-custom-shader = shaders/cursor_smear.glsl
+cursor-style = block
+cursor-style-blink = false
+
 
 
 
@@ -101,3 +103,4 @@ custom-shader = shaders/cursor_smear.glsl
 # 
 # # Catch unbound keys
 # keybind = vim/catch_all=ignore
+custom-shader = shaders/cursor_smear.glsl

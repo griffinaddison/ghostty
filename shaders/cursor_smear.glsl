@@ -1,114 +1,95 @@
-float getSdfRectangle(in vec2 p, in vec2 xy, in vec2 b)
-{
-    vec2 d = abs(p - xy) - b;
-    return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0);
+// Cursor smear shader
+// Stretches and smears the terminal content in the direction of cursor movement,
+// like a cartoon character being squash-and-stretched mid-dash.
+
+const float FADE_DURATION = 0.4;    // seconds — longer visible smear
+const float SMEAR_STRENGTH = 28.0;  // max pixel offset multiplier
+const float SMEAR_RADIUS = 90.0;    // pixels — wider area affected
+
+float sdfSegment(vec2 p, vec2 a, vec2 b) {
+    vec2 pa = p - a, ba = b - a;
+    float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+    return length(pa - ba * h);
 }
 
-// Based on Inigo Quilez's 2D distance functions article: https://iquilezles.org/articles/distfunctions2d/
-// Potencially optimized by eliminating conditionals and loops to enhance performance and reduce branching
+void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+    vec2 uv = fragCoord / iResolution.xy;
 
-float seg(in vec2 p, in vec2 a, in vec2 b, inout float s, float d) {
-    vec2 e = b - a;
-    vec2 w = p - a;
-    vec2 proj = a + e * clamp(dot(w, e) / dot(e, e), 0.0, 1.0);
-    float segd = dot(p - proj, p - proj);
-    d = min(d, segd);
+    float scale = min(iResolution.x, iResolution.y);
 
-    float c0 = step(0.0, p.y - a.y);
-    float c1 = 1.0 - step(0.0, p.y - b.y);
-    float c2 = 1.0 - step(0.0, e.x * w.y - e.y * w.x);
-    float allCond = c0 * c1 * c2;
-    float noneCond = (1.0 - c0) * (1.0 - c1) * (1.0 - c2);
-    float flip = mix(1.0, -1.0, step(0.5, allCond + noneCond));
-    s *= flip;
-    return d;
-}
+    // Cursor centers
+    vec2 curCenter = iCurrentCursor.xy + iCurrentCursor.zw * vec2(0.5, -0.5);
+    vec2 prevCenter = iPreviousCursor.xy + iPreviousCursor.zw * vec2(0.5, -0.5);
+    vec2 delta = curCenter - prevCenter;
+    float jumpDist = length(delta);
 
-float getSdfParallelogram(in vec2 p, in vec2 v0, in vec2 v1, in vec2 v2, in vec2 v3) {
-    float s = 1.0;
-    float d = dot(p - v0, p - v0);
+    float moveIntensity = smoothstep(3.0, 40.0, jumpDist);
 
-    d = seg(p, v0, v3, s, d);
-    d = seg(p, v1, v0, s, d);
-    d = seg(p, v2, v1, s, d);
-    d = seg(p, v3, v2, s, d);
+    float timeSince = iTime - iTimeCursorChange;
+    float timeFade = 1.0 - smoothstep(0.0, FADE_DURATION, timeSince);
+    float intensity = moveIntensity * timeFade;
 
-    return s * sqrt(d);
-}
+    if (intensity < 0.001) {
+        fragColor = texture(iChannel0, uv);
+        return;
+    }
 
-vec2 norm(vec2 value, float isPosition) {
-    return (value * 2.0 - (iResolution.xy * isPosition)) / iResolution.y;
-}
+    // Trail width scales with jump distance:
+    // ~5 chars = cursor-width trail, bigger jumps get wider
+    float charWidth = iCurrentCursor.zw.x;
+    float cursorHalfH = iCurrentCursor.zw.y * 0.5;
+    float charsJumped = jumpDist / max(charWidth, 1.0);
+    // At 5 chars: radius = cursorHalfH. Grows with sqrt beyond that, capped at SMEAR_RADIUS.
+    float baseRadius = clamp(cursorHalfH * sqrt(max(charsJumped, 1.0) / 5.0), cursorHalfH, SMEAR_RADIUS);
 
-float antialising(float distance) {
-    return 1. - smoothstep(0., norm(vec2(2., 2.), 0.).x, distance);
-}
+    // Diffusion: trail widens over time like smoke (radius grows as sqrt(t),
+    // the 2D diffusion kernel width). Diffusion coefficient tuned for visual effect.
+    float diffusionCoeff = 8000.0; // px²/s — how fast the trail spreads
+    float trailRadius = sqrt(baseRadius * baseRadius + diffusionCoeff * timeSince);
+    trailRadius = min(trailRadius, SMEAR_RADIUS);
 
-float determineStartVertexFactor(vec2 a, vec2 b) {
-    // Conditions using step
-    float condition1 = step(b.x, a.x) * step(a.y, b.y); // a.x < b.x && a.y > b.y
-    float condition2 = step(a.x, b.x) * step(b.y, a.y); // a.x > b.x && a.y < b.y
+    float distToTrail = sdfSegment(fragCoord, curCenter, prevCenter);
+    float trailInfluence = 1.0 - smoothstep(0.0, trailRadius, distToTrail);
 
-    // If neither condition is met, return 1 (else case)
-    return 1.0 - max(condition1, condition2);
-}
+    // Smear direction (opposite of movement — pixels "lag behind")
+    vec2 moveDir = normalize(delta);
+    vec2 smearDir = -moveDir;
 
-vec2 getRectangleCenter(vec4 rectangle) {
-    return vec2(rectangle.x + (rectangle.z / 2.), rectangle.y - (rectangle.w / 2.));
-}
-float ease(float x) {
-    return pow(1.0 - x, 3.0);
-}
-vec4 saturate(vec4 color, float factor) {
-    float gray = dot(color, vec4(0.299, 0.587, 0.114, 0.)); // luminance
-    return mix(vec4(gray), color, factor);
-}
+    // Where along the trail is this fragment? 0 = prev, 1 = current
+    vec2 toCur = fragCoord - prevCenter;
+    float alongTrail = dot(toCur, moveDir) / jumpDist;
+    alongTrail = clamp(alongTrail, 0.0, 1.0);
 
-const float OPACITY = 0.2;
-const float DURATION = 0.02; //IN SECONDS
+    // Strongest near current cursor position, fading toward where it came from.
+    // The "tail" trails behind the cursor's destination.
+    float tailBias = pow(alongTrail, 2.0);
 
-void mainImage(out vec4 fragColor, in vec2 fragCoord)
-{
-    fragColor = texture(iChannel0, fragCoord.xy / iResolution.xy);
-    // Normalization for fragCoord to a space of -1 to 1;
-    vec2 vu = norm(fragCoord, 1.);
-    vec2 offsetFactor = vec2(-.5, 0.5);
+    // Directional bias: pixels directly behind the cursor (along motion axis)
+    // get much more displacement than pixels off to the side.
+    // This makes the smear clearly directional like a comet tail.
+    vec2 perpDir = vec2(-moveDir.y, moveDir.x);
+    float perpDist = abs(dot(fragCoord - curCenter, perpDir));
+    float directionalFocus = exp(-perpDist * perpDist / (trailRadius * trailRadius * 0.12));
 
-    // Normalization for cursor position and size;
-    // cursor xy has the postion in a space of -1 to 1;
-    // zw has the width and height
-    vec4 currentCursor = vec4(norm(iCurrentCursor.xy, 1.), norm(iCurrentCursor.zw, 0.));
-    vec4 previousCursor = vec4(norm(iPreviousCursor.xy, 1.), norm(iPreviousCursor.zw, 0.));
+    float smearAmount = intensity * trailInfluence * directionalFocus * SMEAR_STRENGTH;
 
-    // When drawing a parellelogram between cursors for the trail i need to determine where to start at the top-left or top-right vertex of the cursor
-    float vertexFactor = determineStartVertexFactor(currentCursor.xy, previousCursor.xy);
-    float invertedVertexFactor = 1.0 - vertexFactor;
+    vec2 offset = smearDir * smearAmount * tailBias * iCurrentCursor.zw.y * 0.5;
+    vec2 smearUV = (fragCoord + offset) / iResolution.xy;
+    smearUV = clamp(smearUV, 0.0, 1.0);
 
-    // Set every vertex of my parellogram
-    vec2 v0 = vec2(currentCursor.x + currentCursor.z * vertexFactor, currentCursor.y - currentCursor.w);
-    vec2 v1 = vec2(currentCursor.x + currentCursor.z * invertedVertexFactor, currentCursor.y);
-    vec2 v2 = vec2(previousCursor.x + currentCursor.z * invertedVertexFactor, previousCursor.y);
-    vec2 v3 = vec2(previousCursor.x + currentCursor.z * vertexFactor, previousCursor.y - previousCursor.w);
+    // Multi-sample along smear direction for motion-blur effect
+    vec4 original = texture(iChannel0, uv);
+    vec4 smeared = texture(iChannel0, smearUV);
+    // Extra samples along the offset for streakier look
+    vec4 smeared2 = texture(iChannel0, clamp((fragCoord + offset * 0.5) / iResolution.xy, 0.0, 1.0));
+    vec4 smeared3 = texture(iChannel0, clamp((fragCoord + offset * 0.25) / iResolution.xy, 0.0, 1.0));
+    // Weighted toward the sharp original-offset sample, less blur
+    smeared = smeared * 0.6 + smeared2 * 0.25 + smeared3 * 0.15;
 
-    float sdfCurrentCursor = getSdfRectangle(vu, currentCursor.xy - (currentCursor.zw * offsetFactor), currentCursor.zw * 0.5);
-    float sdfTrail = getSdfParallelogram(vu, v0, v1, v2, v3);
+    float blend = trailInfluence * directionalFocus * intensity * 0.65;
+    fragColor = mix(original, smeared, blend);
 
-    float progress = clamp((iTime - iTimeCursorChange) / DURATION, 0.0, 1.0);
-    float easedProgress = ease(progress);
-    // Distance between cursors determine the total length of the parallelogram;
-    vec2 centerCC = getRectangleCenter(currentCursor);
-    vec2 centerCP = getRectangleCenter(previousCursor);
-    float lineLength = distance(centerCC, centerCP);
-
-    vec4 newColor = vec4(fragColor);
-
-    vec4 trail = iCurrentCursorColor;
-    trail = saturate(trail, 2.5);
-    // Draw trail
-    newColor = mix(newColor, trail, antialising(sdfTrail));
-    // Draw current cursor
-    newColor = mix(newColor, trail, antialising(sdfCurrentCursor));
-    newColor = mix(newColor, fragColor, step(sdfCurrentCursor, 0.));
-    // newColor = mix(fragColor, newColor, OPACITY);
-    fragColor = mix(fragColor, newColor, step(sdfCurrentCursor, easedProgress * lineLength));
+    // Cartoon cloud: soft white haze that follows the smear shape
+    float cloudAlpha = blend * tailBias * 0.06;
+    fragColor.rgb = mix(fragColor.rgb, vec3(1.0), cloudAlpha);
 }
